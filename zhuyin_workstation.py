@@ -5,6 +5,8 @@
 Run inside the remote graphical session: python zhuyin_workstation.py
 The same file also runs with python3.
 Ctrl+Alt+P opens the composer at the pointer without moving keyboard focus.
+Press 1 to 7 to choose a candidate after entering a tone.
+Press Right to continue a syllable starting with the 1, 2, or 5 key.
 Use Enter to insert in an editor and F2 in a terminal. Keep typing after
 inserting a word, and press Esc when you want to close the composer.
 Ctrl+C in the launcher terminal exits the tool.
@@ -339,6 +341,7 @@ class Composer(object):
         self.parts = []
         self.candidates = []
         self.cursor = 0
+        self.number_selection = False
         self.notice = ""
 
     @property
@@ -357,9 +360,10 @@ class Composer(object):
     def page(self):
         return self.cursor // PAGE_SIZE
 
-    def refresh(self):
+    def refresh(self, select_with_numbers=False):
         self.candidates = self.dictionary.candidates(self.readings)
         self.cursor = 0
+        self.number_selection = select_with_numbers and bool(self.candidates)
         self.notice = ""
 
     def choose(self, index):
@@ -370,7 +374,7 @@ class Composer(object):
         if choice.consumed > len(self.completed):
             self.current = u""
         del self.completed[:choice.consumed]
-        self.refresh()
+        self.refresh(select_with_numbers=not self.current)
 
     def finish(self):
         if not self.readings:
@@ -399,18 +403,22 @@ class Composer(object):
             _, self.completed = self.parts.pop()
             if self.completed and self.completed[-1].tone == "0":
                 self.current = self.completed.pop().symbols
-        self.refresh()
+        self.refresh(select_with_numbers=not self.current)
 
     def read_key(self, key, shifted):
         if key == "BackSpace":
             self.backspace()
+        elif key == "Right":
+            self.number_selection = False
         elif key in {"Up", "Down"} and self.candidates:
             self.cursor = (self.cursor + (-1 if key == "Up" else 1)) % len(self.candidates)
+            self.number_selection = True
         elif key in {"Tab", "ISO_Left_Tab", "Page_Up", "Page_Down"} and self.candidates:
             pages = (len(self.candidates) + PAGE_SIZE - 1) // PAGE_SIZE
             step = -1 if key in {"ISO_Left_Tab", "Page_Up"} or shifted else 1
             self.cursor = ((self.page + step) % pages) * PAGE_SIZE
-        elif shifted and len(key) == 1 and "1" <= key <= str(PAGE_SIZE):
+            self.number_selection = True
+        elif (shifted or self.number_selection) and len(key) == 1 and "1" <= key <= str(PAGE_SIZE):
             self.choose(self.page * PAGE_SIZE + int(key) - 1)
         elif shifted and key in PUNCTUATION:
             text = self.finish()
@@ -425,7 +433,7 @@ class Composer(object):
             if self.current:
                 self.completed.append(Syllable(self.current, TONE_KEYS[key]))
                 self.current = u""
-                self.refresh()
+                self.refresh(select_with_numbers=True)
             elif key == "space":
                 self.choose(self.cursor)
         elif key in ZHUYIN_KEYS and not shifted:
@@ -808,7 +816,11 @@ class Popup(object):
             shown = u"找不到候選字"
         pages = (len(composer.candidates) + PAGE_SIZE - 1) // PAGE_SIZE
         instructions = u"空白 一聲　6 二聲　3 三聲　4 四聲　7 輕聲\n"
-        instructions += u"Shift+數字 選字　Tab 翻頁　Enter 編輯區　F2 終端機　Esc 關閉"
+        if composer.number_selection:
+            instructions += u"1–7 選字　→ 續打 ㄅ／ㄉ／ㄓ　Tab 翻頁\n"
+        else:
+            instructions += u"輸入聲調後按 1–7 選字　Tab 翻頁\n"
+        instructions += u"Enter 編輯區　F2 終端機　Esc 關閉"
         if pages > 1:
             instructions = u"{}/{}   ".format(composer.page + 1, pages) + instructions
         self.view.render(line or u"輸入注音", shown or u" ", composer.notice or instructions)
