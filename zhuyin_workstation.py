@@ -5,7 +5,8 @@
 Run inside the remote graphical session: python zhuyin_workstation.py
 The same file also runs with python3.
 Ctrl+Alt+P opens the composer at the pointer without moving keyboard focus.
-Enter inserts; F2 uses the shortcut common in graphical terminals.
+Use Enter to insert in an editor and F2 in a terminal. Keep typing after
+inserting a word, and press Esc when you want to close the composer.
 Ctrl+C in the launcher terminal exits the tool.
 """
 
@@ -807,7 +808,7 @@ class Popup(object):
             shown = u"找不到候選字"
         pages = (len(composer.candidates) + PAGE_SIZE - 1) // PAGE_SIZE
         instructions = u"空白 一聲　6 二聲　3 三聲　4 四聲　7 輕聲\n"
-        instructions += u"Shift+數字 選字　Tab 翻頁　Enter 編輯區　F2 終端機　Esc 取消"
+        instructions += u"Shift+數字 選字　Tab 翻頁　Enter 編輯區　F2 終端機　Esc 關閉"
         if pages > 1:
             instructions = u"{}/{}   ".format(composer.page + 1, pages) + instructions
         self.view.render(line or u"輸入注音", shown or u" ", composer.notice or instructions)
@@ -823,6 +824,9 @@ class Popup(object):
 
     def hide(self):
         self.native.release()
+        self.dismiss()
+
+    def dismiss(self):
         self.view.hide()
         self.original_focus = None
         self.delivery = None
@@ -834,10 +838,21 @@ class Popup(object):
             return
         target = self.original_focus
         self.view.copy(text)
-        self.hide()
-        if self.native.focus() == target and not self.native.paste(in_terminal):
+        # Let the paste keystroke reach the original window before grabbing
+        # the keyboard again for the next word.
+        self.native.release()
+        if self.native.focus() != target:
+            self.dismiss()
+            return
+        if not self.native.paste(in_terminal):
             print("Text was copied, but the paste shortcut could not be sent.", file=sys.stderr)
             sys.stderr.flush()
+        if self.native.focus() != target or not self.native.grab():
+            self.dismiss()
+            return
+        self.delivery = None
+        self.composer.reset()
+        self.draw()
 
     def tick(self):
         if self.original_focus and self.native.focus() != self.original_focus:
@@ -859,9 +874,7 @@ class Popup(object):
                 text = self.composer.finish()
                 if text:
                     self.delivery = (text, event.key.keycode, key == "F2")
-                elif text == "":
-                    self.hide()
-                else:
+                elif text is None:
                     self.draw()
             else:
                 self.composer.read_key(key, bool(state & SHIFT))
