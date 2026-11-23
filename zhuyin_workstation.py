@@ -7,6 +7,8 @@ The same file also runs with python3.
 Ctrl+Alt+P opens the composer at the pointer without moving keyboard focus.
 Press 1 to 7 to choose a candidate after entering a tone.
 Press Right to continue a syllable starting with the 1, 2, or 5 key.
+Press F3 to switch between Zhuyin and numbers. The numeric keypad can
+also enter numbers directly. Backspace edits the composer or the target.
 Use Enter to insert in an editor and F2 in a terminal. Keep typing after
 inserting a word, and press Esc when you want to close the composer.
 Ctrl+C in the launcher terminal exits the tool.
@@ -259,6 +261,12 @@ ZHUYIN_KEYS = dict(zip(
 TONE_KEYS = {"space": "1", "6": "2", "3": "3", "4": "4", "7": "5"}
 TONE_MARKS = {"0": u"", "1": u"", "2": u"ˊ", "3": u"ˇ", "4": u"ˋ", "5": u"˙"}
 PUNCTUATION = {",": u"，", ".": u"。", "/": u"？", ";": u"：", "-": u"－"}
+KEYPAD_NUMBERS = {"KP_" + digit: digit for digit in "0123456789"}
+KEYPAD_NUMBERS.update({
+    "KP_Insert": "0", "KP_End": "1", "KP_Down": "2", "KP_Next": "3", "KP_Page_Down": "3",
+    "KP_Left": "4", "KP_Begin": "5", "KP_Right": "6", "KP_Home": "7", "KP_Up": "8",
+    "KP_Prior": "9", "KP_Page_Up": "9", "KP_Delete": ".", "KP_Decimal": ".", "KP_Subtract": "-",
+})
 PAGE_SIZE = 7
 MAX_SYLLABLES = 24
 
@@ -282,6 +290,7 @@ class Dictionary(object):
         source = zlib.decompress(base64.b64decode(UNIHAN_DATA)).decode("utf-8")
         self.characters = {}
         self.phrases = {}
+        self.recent_choices = {}
         for row in source.splitlines():
             symbols, tone, characters = row.split("\t")
             self.characters[Syllable(symbols, tone)] = characters
@@ -297,15 +306,24 @@ class Dictionary(object):
         symbols = value.rstrip("12345")
         return symbols, value[len(symbols):]
 
+    def remember(self, readings, text):
+        if 0 < len(readings) <= MAX_SYLLABLES:
+            self.recent_choices[tuple(readings)] = text
+            self.longest_phrase = max(self.longest_phrase, len(readings))
+
     def matches(self, readings, start):
         spelling = []
         stop = min(len(readings), start + self.longest_phrase)
         for end in range(start, stop):
             spelling.append(readings[end].symbols)
+            segment = readings[start:end + 1]
+            remembered = self.recent_choices.get(tuple(segment))
+            if remembered:
+                yield Candidate(remembered, len(segment))
             for tones, text in self.phrases.get(tuple(spelling), ()):
                 if all(unit.tone == "0" or unit.tone in allowed
-                       for unit, allowed in zip(readings[start:end + 1], tones)):
-                    yield Candidate(text, end + 1 - start)
+                       for unit, allowed in zip(segment, tones)):
+                    yield Candidate(text, len(segment))
         for character in self.characters.get(readings[start], ""):
             yield Candidate(character, 1)
 
@@ -335,7 +353,9 @@ class Composer(object):
         self.dictionary = dictionary
         self.reset()
 
-    def reset(self):
+    def reset(self, keep_number_mode=False):
+        if not keep_number_mode:
+            self.number_mode = False
         self.completed = []
         self.current = u""
         self.parts = []
@@ -359,6 +379,10 @@ class Composer(object):
     @property
     def page(self):
         return self.cursor // PAGE_SIZE
+
+    @property
+    def empty(self):
+        return not (self.parts or self.completed or self.current)
 
     def refresh(self, select_with_numbers=False):
         self.candidates = self.dictionary.candidates(self.readings)
@@ -394,20 +418,49 @@ class Composer(object):
                 return self.text + chosen.text + suffixes[0].text
         return self.text + self.candidates[0].text
 
+    def remember_choices(self):
+        for text, readings in self.parts:
+            if readings:
+                self.dictionary.remember(readings, text)
+        if self.cursor:
+            choice = self.candidates[self.cursor]
+            self.dictionary.remember(self.readings[:choice.consumed], choice.text)
+        if len(self.parts) > 1 and not self.readings and all(readings for _, readings in self.parts):
+            readings = [unit for _, units in self.parts for unit in units]
+            self.dictionary.remember(readings, self.text)
+
+    def append_literal(self, literal):
+        if self.readings:
+            text = self.finish()
+            if text is None:
+                return
+            self.parts.append((text[len(self.text):], self.readings))
+            self.completed = []
+            self.current = u""
+        self.parts.append((literal, []))
+        self.refresh()
+
     def backspace(self):
         if self.current:
             self.current = self.current[:-1]
         elif self.completed:
             self.current = self.completed.pop().symbols
         elif self.parts:
-            _, self.completed = self.parts.pop()
-            if self.completed and self.completed[-1].tone == "0":
-                self.current = self.completed.pop().symbols
+            text, readings = self.parts.pop()
+            if len(text) > 1:
+                self.parts.append((text[:-1], readings[:-1]))
         self.refresh(select_with_numbers=not self.current)
 
     def read_key(self, key, shifted):
         if key == "BackSpace":
             self.backspace()
+        elif key == "F3":
+            self.number_mode = not self.number_mode
+        elif key in KEYPAD_NUMBERS:
+            self.append_literal(KEYPAD_NUMBERS[key])
+        elif self.number_mode:
+            if len(key) == 1 and key in "0123456789.-":
+                self.append_literal(key)
         elif key == "Right":
             self.number_selection = False
         elif key in {"Up", "Down"} and self.candidates:
@@ -421,14 +474,7 @@ class Composer(object):
         elif (shifted or self.number_selection) and len(key) == 1 and "1" <= key <= str(PAGE_SIZE):
             self.choose(self.page * PAGE_SIZE + int(key) - 1)
         elif shifted and key in PUNCTUATION:
-            text = self.finish()
-            if text is not None:
-                if self.readings:
-                    self.parts.append((text[len(self.text):], self.readings))
-                    self.completed = []
-                    self.current = u""
-                self.parts.append((PUNCTUATION[key], []))
-                self.refresh()
+            self.append_literal(PUNCTUATION[key])
         elif key in TONE_KEYS:
             if self.current:
                 self.completed.append(Syllable(self.current, TONE_KEYS[key]))
@@ -608,8 +654,6 @@ class X11(object):
         key_names = {
             "comma": ",", "period": ".", "semicolon": ";", "slash": "/", "minus": "-",
         }
-        if name.startswith("KP_") and len(name) == 4:
-            return name[3:]
         return key_names.get(name, name.lower() if len(name) == 1 else name)
 
     def keys_are_down(self, *codes):
@@ -622,6 +666,9 @@ class X11(object):
         if in_terminal:
             keys.append(self.code("Shift_L"))
         keys.append(self.code("v"))
+        return self.send_keys(keys)
+
+    def send_keys(self, keys):
         if not all(keys):
             return False
         for code in keys:
@@ -815,11 +862,16 @@ class Popup(object):
         if composer.pending and not shown:
             shown = u"找不到候選字"
         pages = (len(composer.candidates) + PAGE_SIZE - 1) // PAGE_SIZE
-        instructions = u"空白 一聲　6 二聲　3 三聲　4 四聲　7 輕聲\n"
-        if composer.number_selection:
-            instructions += u"1–7 選字　→ 續打 ㄅ／ㄉ／ㄓ　Tab 翻頁\n"
+        if composer.number_mode:
+            line = u"數字模式　" + line
+            instructions = u"0–9 輸入數字　F3 回注音\n"
         else:
-            instructions += u"輸入聲調後按 1–7 選字　Tab 翻頁\n"
+            instructions = u"空白 一聲　6 二聲　3 三聲　4 四聲　7 輕聲\n"
+            if composer.number_selection:
+                instructions += u"1–7 選字　→ 續打 ㄅ／ㄉ／ㄓ　Tab 翻頁\n"
+            else:
+                instructions += u"輸入聲調後按 1–7 選字　Tab 翻頁\n"
+            instructions += u"F3 數字模式　"
         instructions += u"Enter 編輯區　F2 終端機　Esc 關閉"
         if pages > 1:
             instructions = u"{}/{}   ".format(composer.page + 1, pages) + instructions
@@ -849,21 +901,25 @@ class Popup(object):
         if self.native.keys_are_down(keycode, *self.modifiers):
             return
         target = self.original_focus
-        self.view.copy(text)
-        # Let the paste keystroke reach the original window before grabbing
-        # the keyboard again for the next word.
+        if text is not None:
+            self.view.copy(text)
+        # Let the keystroke reach the original window before grabbing the
+        # keyboard again for the next word.
         self.native.release()
         if self.native.focus() != target:
             self.dismiss()
             return
-        if not self.native.paste(in_terminal):
-            print("Text was copied, but the paste shortcut could not be sent.", file=sys.stderr)
+        sent = self.native.send_keys([keycode]) if text is None else self.native.paste(in_terminal)
+        if not sent:
+            print("Could not send the keystroke to the input field.", file=sys.stderr)
             sys.stderr.flush()
+        elif text is not None:
+            self.composer.remember_choices()
         if self.native.focus() != target or not self.native.grab():
             self.dismiss()
             return
         self.delivery = None
-        self.composer.reset()
+        self.composer.reset(keep_number_mode=True)
         self.draw()
 
     def tick(self):
@@ -882,6 +938,8 @@ class Popup(object):
             key = self.native.key_name(event.key)
             if key == "Escape":
                 self.hide()
+            elif key == "BackSpace" and self.composer.empty:
+                self.delivery = (None, event.key.keycode, False)
             elif key in {"Return", "KP_Enter", "F2"}:
                 text = self.composer.finish()
                 if text:
