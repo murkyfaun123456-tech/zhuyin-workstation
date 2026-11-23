@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Offline Traditional Chinese Zhuyin input for an X11 desktop.
 
 Run inside the remote graphical session: python3 zhuyin_workstation.py
@@ -7,13 +8,23 @@ Enter inserts; F2 uses the shortcut common in graphical terminals.
 Ctrl+C in the launcher terminal exits the tool.
 """
 
+from __future__ import print_function
+
+import sys
+
+if sys.version_info < (3, 7):
+    raise SystemExit(
+        "This tool requires Python 3.7 or newer.\n"
+        "Run: python3 zhuyin_workstation.py\n"
+        "Check your version: python3 --version"
+    )
+
 import base64
+from collections import namedtuple
 import ctypes as C
 import ctypes.util
-from dataclasses import dataclass
 import os
 import signal
-import sys
 import zlib
 
 
@@ -254,20 +265,15 @@ PAGE_SIZE = 7
 MAX_SYLLABLES = 24
 
 
-@dataclass(frozen=True)
-class Syllable:
-    symbols: str
-    tone: str = "0"
+class Syllable(namedtuple("Syllable", ("symbols", "tone"), defaults=("0",))):
+    __slots__ = ()
 
     def display(self):
         mark = TONE_MARKS[self.tone]
         return mark + self.symbols if self.tone == "5" else self.symbols + mark
 
 
-@dataclass(frozen=True)
-class Candidate:
-    text: str
-    consumed: int
+Candidate = namedtuple("Candidate", ("text", "consumed"))
 
 
 class Dictionary:
@@ -279,7 +285,8 @@ class Dictionary:
             symbols, tone, characters = row.split("\t")
             self.characters[Syllable(symbols, tone)] = characters
         for row in PHRASES.strip().splitlines():
-            *syllables, text = row.split()
+            fields = row.split()
+            syllables, text = fields[:-1], fields[-1]
             spellings, tones = zip(*(self.split_tones(syllable) for syllable in syllables))
             self.phrases.setdefault(spellings, []).append((tones, text))
         self.longest_phrase = max(map(len, self.phrases))
@@ -471,6 +478,7 @@ class X11:
         lib = C.CDLL(C.util.find_library("X11") or "libX11.so.6")
         test = C.CDLL(C.util.find_library("Xtst") or "libXtst.so.6")
         ptr, xid, uint, integer = C.c_void_p, C.c_ulong, C.c_uint, C.c_int
+        int_pointer = C.POINTER(integer)
         self.open_display = native_function(lib, "XOpenDisplay", ptr, C.c_char_p)
         self.close_display = native_function(lib, "XCloseDisplay", integer, ptr)
         self.root_window = native_function(lib, "XDefaultRootWindow", xid, ptr)
@@ -488,7 +496,7 @@ class X11:
         self.get_focus = native_function(lib, "XGetInputFocus", integer, ptr, C.POINTER(xid), C.POINTER(integer))
         self.query_pointer = native_function(
             lib, "XQueryPointer", integer, ptr, xid, C.POINTER(xid), C.POINTER(xid),
-            *([C.POINTER(integer)] * 4), C.POINTER(uint),
+            int_pointer, int_pointer, int_pointer, int_pointer, C.POINTER(uint),
         )
         self.get_modifier_map = native_function(lib, "XGetModifierMapping", C.POINTER(XModifierKeymap), ptr)
         self.free_modifier_map = native_function(lib, "XFreeModifiermap", integer, C.POINTER(XModifierKeymap))
@@ -560,11 +568,12 @@ class X11:
         self.get_focus(self.display, C.byref(window), C.byref(revert))
         if window.value == 1:  # PointerRoot is used by X11 sessions without a window manager.
             root, child = C.c_ulong(), C.c_ulong()
-            coordinates = [C.c_int() for _ in range(4)]
+            root_x, root_y, window_x, window_y = (C.c_int() for _ in range(4))
             buttons = C.c_uint()
             if self.query_pointer(
                 self.display, self.root, C.byref(root), C.byref(child),
-                *(C.byref(value) for value in coordinates), C.byref(buttons),
+                C.byref(root_x), C.byref(root_y), C.byref(window_x), C.byref(window_y),
+                C.byref(buttons),
             ):
                 return child.value
         return window.value
@@ -650,7 +659,7 @@ class Popup:
         start = composer.page * PAGE_SIZE
         choices = composer.candidates[start:start + PAGE_SIZE]
         shown = "   ".join(
-            f"{'▸' if start + index == composer.cursor else ''}{index + 1} {item.text}"
+            "{}{} {}".format("▸" if start + index == composer.cursor else "", index + 1, item.text)
             for index, item in enumerate(choices)
         )
         if composer.pending and not shown:
@@ -660,7 +669,7 @@ class Popup:
         instructions = "空白 一聲　6 二聲　3 三聲　4 四聲　7 輕聲\n"
         instructions += "Shift+數字 選字　Tab 翻頁　Enter 編輯區　F2 終端機　Esc 取消"
         if pages > 1:
-            instructions = f"{composer.page + 1}/{pages}   " + instructions
+            instructions = "{}/{}   ".format(composer.page + 1, pages) + instructions
         self.help.configure(text=composer.notice or instructions)
 
     def activate(self):
@@ -675,7 +684,7 @@ class Popup:
         screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         x = max(0, min(x + 12, screen_w - max(540, self.window.winfo_reqwidth())))
         y = max(0, min(y + 22, screen_h - 160))
-        self.window.geometry(f"+{x}+{y}")
+        self.window.geometry("+{}+{}".format(x, y))
         self.window.deiconify()
         self.window.lift()
 
@@ -744,16 +753,18 @@ def main():
     try:
         root = tk.Tk()
     except tk.TclError as error:
-        raise SystemExit(f"無法開啟圖形視窗：{error}")
+        raise SystemExit("無法開啟圖形視窗：{}".format(error))
     root.withdraw()
     try:
         native = X11()
     except (OSError, RuntimeError) as error:
         root.destroy()
-        raise SystemExit(f"無法啟動注音輸入：{error}")
+        raise SystemExit("無法啟動注音輸入：{}".format(error))
     try:
         popup = Popup(root, tk, native, Dictionary())
-        print(f"注音輸入已啟動。使用 Ctrl+Alt+{native.hotkey.upper()} 開啟選字，Ctrl+C 結束。", flush=True)
+        print("注音輸入已啟動。使用 Ctrl+Alt+{} 開啟選字，Ctrl+C 結束。".format(
+            native.hotkey.upper(),
+        ), flush=True)
         signal.signal(signal.SIGINT, lambda *_: root.quit())
         root.after(15, popup.tick)
         root.mainloop()
