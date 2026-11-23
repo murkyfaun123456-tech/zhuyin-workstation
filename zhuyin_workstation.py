@@ -18,6 +18,8 @@ import ctypes.util
 import os
 import signal
 import sys
+import time
+from xml.sax.saxutils import escape
 import zlib
 
 
@@ -559,19 +561,22 @@ class X11(object):
             self.sync(self.display, 0)
         return not failures
 
+    def pointer(self):
+        root, child = C.c_ulong(), C.c_ulong()
+        root_x, root_y, window_x, window_y = (C.c_int() for _ in range(4))
+        buttons = C.c_uint()
+        self.query_pointer(
+            self.display, self.root, C.byref(root), C.byref(child),
+            C.byref(root_x), C.byref(root_y), C.byref(window_x), C.byref(window_y),
+            C.byref(buttons),
+        )
+        return child.value, root_x.value, root_y.value
+
     def focus(self):
         window, revert = C.c_ulong(), C.c_int()
         self.get_focus(self.display, C.byref(window), C.byref(revert))
         if window.value == 1:  # PointerRoot is used by X11 sessions without a window manager.
-            root, child = C.c_ulong(), C.c_ulong()
-            root_x, root_y, window_x, window_y = (C.c_int() for _ in range(4))
-            buttons = C.c_uint()
-            if self.query_pointer(
-                self.display, self.root, C.byref(root), C.byref(child),
-                C.byref(root_x), C.byref(root_y), C.byref(window_x), C.byref(window_y),
-                C.byref(buttons),
-            ):
-                return child.value
+            return self.pointer()[0]
         return window.value
 
     def grab(self):
@@ -623,17 +628,13 @@ class X11(object):
             self.display = None
 
 
-class Popup(object):
-    def __init__(self, root, tk, native, dictionary):
-        self.root = root
-        self.native = native
-        self.composer = Composer(dictionary)
-        self.original_focus = None
-        self.delivery = None
-        self.modifiers = [native.code(key) for key in (
-            "Control_L", "Control_R", "Shift_L", "Shift_R", "Alt_L", "Alt_R", "Super_L", "Super_R",
-        )]
-        self.window = tk.Toplevel(root, takefocus=False)
+class TkWindow(object):
+    name = "Tkinter"
+
+    def __init__(self, tk):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.window = tk.Toplevel(self.root, takefocus=False)
         self.window.withdraw()
         self.window.overrideredirect(True)
         self.window.attributes("-topmost", True)
@@ -648,10 +649,154 @@ class Popup(object):
         self.help = tk.Label(body, font=("TkDefaultFont", 9), bg="#f4f8fa", fg="#435764", anchor="w", justify="left")
         self.help.pack(fill="x")
 
+    def render(self, line, choices, instructions):
+        self.line.configure(text=line)
+        self.choices.configure(text=choices)
+        self.help.configure(text=instructions)
+
+    def show(self):
+        self.window.update_idletasks()
+        x, y = self.root.winfo_pointerxy()
+        screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        x = max(0, min(x + 12, screen_w - max(540, self.window.winfo_reqwidth())))
+        y = y + 22 if y + 182 < screen_h else max(0, y - 160)
+        self.window.geometry("+{}+{}".format(x, y))
+        self.window.deiconify()
+        self.window.lift()
+
+    def hide(self):
+        self.window.withdraw()
+
+    def copy(self, text):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update_idletasks()
+
+    def run(self, tick):
+        def step():
+            tick()
+            self.root.after(15, step)
+
+        signal.signal(signal.SIGINT, lambda *_: self.root.quit())
+        self.root.after(15, step)
+        self.root.mainloop()
+
+    def close(self):
+        self.root.destroy()
+
+
+class GtkWindow(object):
+    def __init__(self, native):
+        self.native = native
+        for library, name in (("libgtk-3.so.0", "GTK 3"), ("libgtk-x11-2.0.so.0", "GTK 2")):
+            try:
+                gtk = C.CDLL(library)
+                break
+            except OSError:
+                continue
+        else:
+            raise RuntimeError("Tkinter and GTK 3/2 are unavailable on this workstation.")
+        self.name = name
+
+        ptr, integer, string = C.c_void_p, C.c_int, C.c_char_p
+        init_check = native_function(gtk, "gtk_init_check", integer, ptr, ptr)
+        os.environ.setdefault("GDK_BACKEND", "x11")
+        if not init_check(None, None):
+            raise RuntimeError("Could not open GTK in the X11 session.")
+
+        window_new = native_function(gtk, "gtk_window_new", ptr, integer)
+        accept_focus = native_function(gtk, "gtk_window_set_accept_focus", None, ptr, integer)
+        focus_on_map = native_function(gtk, "gtk_window_set_focus_on_map", None, ptr, integer)
+        default_size = native_function(gtk, "gtk_window_set_default_size", None, ptr, integer, integer)
+        border_width = native_function(gtk, "gtk_container_set_border_width", None, ptr, C.c_uint)
+        box_new = native_function(gtk, "gtk_vbox_new", ptr, integer, integer)
+        container_add = native_function(gtk, "gtk_container_add", None, ptr, ptr)
+        box_add = native_function(gtk, "gtk_box_pack_start", None, ptr, ptr, integer, integer, C.c_uint)
+        label_new = native_function(gtk, "gtk_label_new", ptr, string)
+        align = native_function(gtk, "gtk_misc_set_alignment", None, ptr, C.c_float, C.c_float)
+        wrap = native_function(gtk, "gtk_label_set_line_wrap", None, ptr, integer)
+        request_size = native_function(gtk, "gtk_widget_set_size_request", None, ptr, integer, integer)
+
+        self.window = window_new(1)  # GTK_WINDOW_POPUP
+        accept_focus(self.window, 0)
+        focus_on_map(self.window, 0)
+        default_size(self.window, 440, 1)
+        border_width(self.window, 14)
+        box = box_new(0, 6)
+        container_add(self.window, box)
+        self.labels = [label_new(None) for _ in range(3)]
+        for label in self.labels:
+            align(label, 0.0, 0.5)
+            wrap(label, 1)
+            request_size(label, 412, -1)
+            box_add(box, label, 0, 0, 0)
+
+        self.set_markup = native_function(gtk, "gtk_label_set_markup", None, ptr, string)
+        self.move = native_function(gtk, "gtk_window_move", None, ptr, integer, integer)
+        self.show_all = native_function(gtk, "gtk_widget_show_all", None, ptr)
+        self.hide_widget = native_function(gtk, "gtk_widget_hide", None, ptr)
+        self.destroy = native_function(gtk, "gtk_widget_destroy", None, ptr)
+        self.screen_width = native_function(gtk, "gdk_screen_width", integer)
+        self.screen_height = native_function(gtk, "gdk_screen_height", integer)
+        self.events_pending = native_function(gtk, "gtk_events_pending", integer)
+        self.iterate = native_function(gtk, "gtk_main_iteration_do", integer, integer)
+        atom = native_function(gtk, "gdk_atom_intern", ptr, string, integer)
+        clipboard_get = native_function(gtk, "gtk_clipboard_get", ptr, ptr)
+        display_get = native_function(gtk, "gdk_display_get_default", ptr)
+        self.clipboard = clipboard_get(atom(b"CLIPBOARD", 0))
+        self.display = display_get()
+        self.set_clipboard = native_function(gtk, "gtk_clipboard_set_text", None, ptr, string, integer)
+        self.sync_display = native_function(gtk, "gdk_display_sync", None, ptr)
+
+    def render(self, line, choices, instructions):
+        markup = (
+            u'<span size="large" weight="bold">{}</span>'.format(escape(line)),
+            u'<span size="large">{}</span>'.format(escape(choices)),
+            u'<span size="small">{}</span>'.format(escape(instructions)),
+        )
+        for label, content in zip(self.labels, markup):
+            self.set_markup(label, content.encode("utf-8"))
+
+    def show(self):
+        _, x, y = self.native.pointer()
+        x = max(0, min(x + 12, self.screen_width() - 500))
+        y = y + 22 if y + 182 < self.screen_height() else max(0, y - 160)
+        self.move(self.window, x, y)
+        self.show_all(self.window)
+
+    def hide(self):
+        self.hide_widget(self.window)
+
+    def copy(self, text):
+        encoded = text.encode("utf-8")
+        self.set_clipboard(self.clipboard, encoded, len(encoded))
+        self.sync_display(self.display)
+
+    def run(self, tick):
+        while True:
+            while self.events_pending():
+                self.iterate(0)
+            tick()
+            time.sleep(0.015)
+
+    def close(self):
+        self.destroy(self.window)
+
+
+class Popup(object):
+    def __init__(self, view, native, dictionary):
+        self.view = view
+        self.native = native
+        self.composer = Composer(dictionary)
+        self.original_focus = None
+        self.delivery = None
+        self.modifiers = [native.code(key) for key in (
+            "Control_L", "Control_R", "Shift_L", "Shift_R", "Alt_L", "Alt_R", "Super_L", "Super_R",
+        )]
+
     def draw(self):
         composer = self.composer
         line = u"   ".join(part for part in (composer.text, composer.pending) if part)
-        self.line.configure(text=line or u"輸入注音")
         start = composer.page * PAGE_SIZE
         choices = composer.candidates[start:start + PAGE_SIZE]
         shown = u"   ".join(
@@ -660,13 +805,12 @@ class Popup(object):
         )
         if composer.pending and not shown:
             shown = u"找不到候選字"
-        self.choices.configure(text=shown or " ")
         pages = (len(composer.candidates) + PAGE_SIZE - 1) // PAGE_SIZE
         instructions = u"空白 一聲　6 二聲　3 三聲　4 四聲　7 輕聲\n"
         instructions += u"Shift+數字 選字　Tab 翻頁　Enter 編輯區　F2 終端機　Esc 取消"
         if pages > 1:
             instructions = u"{}/{}   ".format(composer.page + 1, pages) + instructions
-        self.help.configure(text=composer.notice or instructions)
+        self.view.render(line or u"輸入注音", shown or u" ", composer.notice or instructions)
 
     def activate(self):
         target = self.native.focus()
@@ -675,18 +819,11 @@ class Popup(object):
         self.original_focus = target
         self.composer.reset()
         self.draw()
-        self.window.update_idletasks()
-        x, y = self.root.winfo_pointerxy()
-        screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        x = max(0, min(x + 12, screen_w - max(540, self.window.winfo_reqwidth())))
-        y = max(0, min(y + 22, screen_h - 160))
-        self.window.geometry("+{}+{}".format(x, y))
-        self.window.deiconify()
-        self.window.lift()
+        self.view.show()
 
     def hide(self):
         self.native.release()
-        self.window.withdraw()
+        self.view.hide()
         self.original_focus = None
         self.delivery = None
         self.composer.reset()
@@ -696,9 +833,7 @@ class Popup(object):
         if self.native.keys_are_down(keycode, *self.modifiers):
             return
         target = self.original_focus
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        self.root.update_idletasks()
+        self.view.copy(text)
         self.hide()
         if self.native.focus() == target and not self.native.paste(in_terminal):
             print("Text was copied, but the paste shortcut could not be sent.", file=sys.stderr)
@@ -733,7 +868,20 @@ class Popup(object):
                 self.draw()
         if self.delivery is not None:
             self.send_if_ready()
-        self.root.after(15, self.tick)
+
+
+def create_window(native):
+    try:
+        if sys.version_info[0] == 2:
+            import Tkinter as tk
+        else:
+            import tkinter as tk
+    except ImportError:
+        return GtkWindow(native)
+    try:
+        return TkWindow(tk)
+    except tk.TclError:
+        return GtkWindow(native)
 
 
 def main():
@@ -744,34 +892,27 @@ def main():
     if not os.environ.get("DISPLAY"):
         raise SystemExit("No desktop display found. Run the script in a terminal on the remote desktop.")
     try:
-        if sys.version_info[0] == 2:
-            import Tkinter as tk
-        else:
-            import tkinter as tk
-    except ImportError:
-        raise SystemExit("Tkinter is missing. Use a Python installation that includes Tkinter.")
-    try:
-        root = tk.Tk()
-    except tk.TclError as error:
-        raise SystemExit("Could not open the desktop window: {}".format(error))
-    root.withdraw()
-    try:
         native = X11()
     except (OSError, RuntimeError) as error:
-        root.destroy()
         raise SystemExit("Could not start Zhuyin input: {}".format(error))
     try:
-        popup = Popup(root, tk, native, Dictionary())
-        print("Zhuyin ready. Press Ctrl+Alt+{} to type, or Ctrl+C here to quit.".format(
-            native.hotkey.upper(),
-        ))
-        sys.stdout.flush()
-        signal.signal(signal.SIGINT, lambda *_: root.quit())
-        root.after(15, popup.tick)
-        root.mainloop()
+        try:
+            view = create_window(native)
+        except (OSError, RuntimeError) as error:
+            raise SystemExit("Could not open the desktop window: {}".format(error))
+        try:
+            popup = Popup(view, native, Dictionary())
+            print("Zhuyin ready ({}). Press Ctrl+Alt+{} to type, or Ctrl+C here to quit.".format(
+                view.name, native.hotkey.upper(),
+            ))
+            sys.stdout.flush()
+            view.run(popup.tick)
+        finally:
+            view.close()
+    except KeyboardInterrupt:
+        pass
     finally:
         native.close()
-        root.destroy()
 
 
 # The embedded single-character data derives from Unicode Unihan 15.1.0.
